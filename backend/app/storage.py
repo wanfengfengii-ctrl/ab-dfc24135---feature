@@ -22,6 +22,8 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
+from .audit import AuditValidationError, build_audit_plan
+
 CHUNK_SIZE = 65536
 
 # Default limits; can be overridden through the environment.
@@ -133,6 +135,9 @@ class UploadStore:
     def _receipt_path(self, session: str) -> str:
         return os.path.join(self._dir(session), "receipt.json")
 
+    def _audit_plan_path(self, session: str) -> str:
+        return os.path.join(self._dir(session), "audit-plan.json")
+
     # ---- reads -----------------------------------------------------------
 
     def get_metadata(self, session: str) -> Optional[Metadata]:
@@ -166,6 +171,7 @@ class UploadStore:
                 return None
             present = sorted(self._present_indices(session, meta.chunk_count))
             receipt = self._read_receipt(session)
+            audit_plan = self._read_audit_plan(session)
             return {
                 "session": session,
                 "total_size": meta.total_size,
@@ -175,11 +181,19 @@ class UploadStore:
                 "missing_ranges": _missing_ranges(set(present), meta.chunk_count),
                 "sealed": receipt is not None,
                 "receipt": receipt,
+                "audit_plan": audit_plan,
             }
 
     def _read_receipt(self, session: str) -> Optional[dict]:
         try:
             raw = _read_json(self._receipt_path(session))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+        return raw
+
+    def _read_audit_plan(self, session: str) -> Optional[dict]:
+        try:
+            raw = _read_json(self._audit_plan_path(session))
         except (FileNotFoundError, json.JSONDecodeError):
             return None
         return raw
@@ -350,3 +364,63 @@ class UploadStore:
             # Write the receipt atomically; from this instant the session is sealed.
             _atomic_write(self._receipt_path(session), seal_marker)
             return receipt, True, None
+
+    # ---- audit plans -----------------------------------------------------
+
+    def create_audit_plan(
+        self, session: str, target, risk_scores, raw_ranges
+    ) -> dict:
+        """Validate and solve a sampling audit plan for a SEALED session.
+
+        Malformed requests raise RejectError (HTTP 400); a session without a
+        sealing receipt raises ConflictError (HTTP 409) and never produces a
+        plan. A valid but infeasible request returns ``solvable: False`` with
+        the blocking reason and removes any plan produced earlier for the
+        session, so stale results can never linger after conditions change.
+        """
+        _validate_session(session)
+        with self._lock:
+            meta = self.get_metadata(session)
+            if meta is None:
+                raise RejectError("unknown session; upload and seal it first")
+            if self._read_receipt(session) is None:
+                raise ConflictError(
+                    "session is not sealed; audit plans require a sealing receipt"
+                )
+
+            plan = build_audit_plan(
+                meta.chunk_count, target, risk_scores, raw_ranges
+            )
+            receipt = self._read_receipt(session)
+            result = {
+                "session": session,
+                "chunk_count": meta.chunk_count,
+                "receipt_id": receipt["receipt_id"],
+                "request": {
+                    "target": plan.target,
+                    "risk_scores": list(risk_scores),
+                    "ranges": [
+                        {"start": r.start, "end": r.end, "quota": r.quota}
+                        for r in plan.ranges
+                    ],
+                },
+                **plan.to_dict(),
+            }
+
+            path = self._audit_plan_path(session)
+            if plan.solvable:
+                result["created_at"] = (
+                    datetime.datetime.now(datetime.timezone.utc)
+                    .isoformat(timespec="seconds")
+                    .replace("+00:00", "Z")
+                )
+                _atomic_write(path, json.dumps(result, indent=2).encode())
+            else:
+                # New conditions admit no plan: never leave an old plan on disk.
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+                else:
+                    _fsync_dir(self._dir(session))
+            return result

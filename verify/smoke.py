@@ -155,6 +155,80 @@ def main():
     check(status == 200 and body["sealed"] is False and body["receipt"] is None,
           "no receipt exists after digest mismatch")
 
+    print("[audit plan: unsealed sessions are blocked]")
+    plan_req = json.dumps(
+        {"target": 2, "risk_scores": [1, 2, 3],
+         "ranges": [{"start": 0, "end": 2, "quota": 1}]}
+    ).encode()
+    status, body = call("POST", f"/api/uploads/{sb}/audit-plan", plan_req,
+                        {"Content-Type": "application/json"})
+    check(status == 409 and "not sealed" in body["error"],
+          f"audit plan on unsealed session -> 409, got {status} {body}")
+    status, body = call("POST", f"/api/uploads/NOPE9999/audit-plan", plan_req,
+                        {"Content-Type": "application/json"})
+    check(status == 400 and "unknown session" in body["error"],
+          "audit plan on unknown session -> 400")
+
+    print("[audit plan: malformed requests are located 400s]")
+    status, body = call(
+        "POST", f"/api/uploads/{s}/audit-plan",
+        json.dumps({"target": 2, "risk_scores": [1, 2],
+                    "ranges": [{"start": 0, "end": 2, "quota": 1}]}).encode(),
+        {"Content-Type": "application/json"})
+    check(status == 400 and "must match actual block count 3" in body["error"],
+          f"risk score count mismatch -> 400 located, got {status} {body}")
+    status, body = call(
+        "POST", f"/api/uploads/{s}/audit-plan",
+        json.dumps({"target": 17, "risk_scores": [1, 2, 3],
+                    "ranges": [{"start": 0, "end": 2, "quota": 1}]}).encode(),
+        {"Content-Type": "application/json"})
+    check(status == 400 and "between 2 and 16" in body["error"],
+          "target out of 2..16 -> 400")
+    status, body = call(
+        "POST", f"/api/uploads/{s}/audit-plan",
+        json.dumps({"target": 2, "risk_scores": [1, 2, 3],
+                    "ranges": [{"start": 0, "end": 1, "quota": 1},
+                               {"start": 1, "end": 2, "quota": 1}]}).encode(),
+        {"Content-Type": "application/json"})
+    check(status == 400 and "must not overlap" in body["error"],
+          "overlapping focus ranges -> 400 located")
+
+    print("[audit plan: optimal, non-adjacent, quota-satisfying]")
+    # 3 blocks; target 2 leaves only {0,2}; scores make the intent explicit.
+    req = {"target": 2, "risk_scores": [10, 90, 10],
+           "ranges": [{"start": 0, "end": 2, "quota": 1}]}
+    status, body = call("POST", f"/api/uploads/{s}/audit-plan",
+                        json.dumps(req).encode(),
+                        {"Content-Type": "application/json"})
+    check(status == 200 and body["solvable"] is True,
+          f"audit plan created: {body}")
+    check(body["blocks"] == [0, 2] and body["risk_sum"] == 20,
+          f"only legal non-adjacent pair chosen, got {body.get('blocks')}")
+    check(len(body["blocks"]) == body["target"] == 2, "exactly target blocks")
+    check(all(b - a >= 2 for a, b in zip(body["blocks"], body["blocks"][1:])),
+          "no two selected blocks are adjacent")
+    check(body["ranges"][0]["selected"] >= body["ranges"][0]["quota"],
+          "focus quota met and accounted")
+    # persisted and surfaced by the status endpoint
+    status, got = call("GET", f"/api/uploads/{s}")
+    check(status == 200 and got["audit_plan"] is not None
+          and got["audit_plan"]["blocks"] == [0, 2],
+          "audit plan persisted and returned by status")
+
+    print("[audit plan: infeasible conditions block without a fake plan]")
+    # quota 2 inside the adjacent pair [0,1] cannot be met non-adjacently
+    bad_req = {"target": 2, "risk_scores": [10, 90, 10],
+               "ranges": [{"start": 0, "end": 1, "quota": 2}]}
+    status, body = call("POST", f"/api/uploads/{s}/audit-plan",
+                        json.dumps(bad_req).encode(),
+                        {"Content-Type": "application/json"})
+    check(status == 200 and body["solvable"] is False
+          and body["blocks"] == [] and "no feasible plan" in body["block_reason"],
+          f"infeasible -> 200 with explicit blocking condition, got {body}")
+    status, got = call("GET", f"/api/uploads/{s}")
+    check(got["audit_plan"] is None,
+          "the infeasible resubmission removed the previously stored plan")
+
     print(f"\nSMOKE OK against {BASE} (sessions {s}, {sb})")
 
 

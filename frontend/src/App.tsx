@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useState } from "react";
 import {
   ApiError,
+  AuditPlanResponse,
   CHUNK_SIZE,
   MAX_FILE_SIZE,
   MIN_FILE_SIZE,
@@ -13,6 +14,7 @@ import {
   seal,
   sha256Hex,
 } from "./api";
+import AuditPlanner from "./AuditPlanner";
 import "./styles.css";
 
 interface ChunkError {
@@ -45,6 +47,7 @@ export default function App() {
   const [receipt, setReceipt] = useState<Receipt | null>(null);
   const [sealed, setSealed] = useState(false);
   const [notice, setNotice] = useState<string>("");
+  const [auditPlan, setAuditPlan] = useState<AuditPlanResponse | null>(null);
 
   const sessionValid = SESSION_RE.test(session);
   const fileError = useMemo(() => {
@@ -66,6 +69,7 @@ export default function App() {
     setNotice("");
     setChunkCount(0);
     setTotalSize(0);
+    setAuditPlan(null);
   }, []);
 
   const onPickFile = useCallback(
@@ -197,6 +201,7 @@ export default function App() {
       setConfirmed(new Set(status.confirmed_chunks));
       setSealed(status.sealed);
       setReceipt(status.receipt);
+      setAuditPlan(status.audit_plan);
       setNotice(
         status.sealed
           ? "该会话已封存，回执如下（服务重启后仍然保留）。"
@@ -328,6 +333,22 @@ export default function App() {
             <dt>封存时间 (UTC)</dt>
             <dd>{receipt.sealed_at}</dd>
           </dl>
+        </section>
+      )}
+
+      {sealed && receipt && chunkCount > 0 && (
+        <section className="card audit-card">
+          <AuditPlanner
+            key={session}
+            session={session}
+            chunkCount={chunkCount}
+            plan={auditPlan}
+            onCommitted={() => {
+              // Re-fetch authoritative state so the persisted plan is visible
+              // (and any old plan removed by an infeasible resubmission).
+              void handleRefresh();
+            }}
+          />
         </section>
       )}
     </main>

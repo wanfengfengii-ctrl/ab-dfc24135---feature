@@ -16,6 +16,7 @@ from .storage import (
     RejectError,
     UploadStore,
 )
+from .audit import AuditValidationError
 
 SESSION_RE = re.compile(r"^[A-Za-z0-9]{1,32}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -56,6 +57,13 @@ def _reject_handler(_request: Request, exc: RejectError) -> JSONResponse:
 @app.exception_handler(ConflictError)
 def _conflict_handler(_request: Request, exc: ConflictError) -> JSONResponse:
     return JSONResponse(status_code=409, content={"error": str(exc)})
+
+
+@app.exception_handler(AuditValidationError)
+def _audit_validation_handler(
+    _request: Request, exc: AuditValidationError
+) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
 @app.get("/health")
@@ -117,6 +125,23 @@ def seal(session: str) -> JSONResponse:
             },
         )
     return JSONResponse(status_code=200, content=result)
+
+
+@app.post("/api/uploads/{session}/audit-plan")
+async def create_audit_plan(session: str, request: Request) -> dict:
+    _check_session(session)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="request body must be JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="request body must be a JSON object")
+    return store.create_audit_plan(
+        session,
+        payload.get("target"),
+        payload.get("risk_scores"),
+        payload.get("ranges"),
+    )
 
 
 # Serve the built React SPA from the same origin (API routes take priority).

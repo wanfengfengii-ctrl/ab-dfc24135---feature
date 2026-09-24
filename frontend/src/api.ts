@@ -36,6 +36,54 @@ export interface SessionStatus {
   missing_ranges: [number, number][];
   sealed: boolean;
   receipt: Receipt | null;
+  audit_plan: AuditPlanResponse | null;
+}
+
+export interface AuditRangeInput {
+  start: number;
+  end: number;
+  quota: number;
+}
+
+export interface AuditRangeAccounting extends AuditRangeInput {
+  selected: number;
+}
+
+export interface AuditPlanResponse {
+  session: string;
+  chunk_count: number;
+  receipt_id: string;
+  target: number;
+  blocks: number[];
+  risk_sum: number;
+  solvable: boolean;
+  block_reason: string | null;
+  ranges: AuditRangeAccounting[];
+  request?: {
+    target: number;
+    risk_scores: number[];
+    ranges: AuditRangeInput[];
+  };
+  created_at?: string;
+}
+
+export interface AuditPlanRequest {
+  target: number;
+  risk_scores: number[];
+  ranges: AuditRangeInput[];
+}
+
+export async function createAuditPlan(
+  session: string,
+  body: AuditPlanRequest
+): Promise<AuditPlanResponse> {
+  const res = await fetch(`/api/uploads/${session}/audit-plan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw await parseError(res);
+  return (await res.json()) as AuditPlanResponse;
 }
 
 export class ApiError extends Error {
