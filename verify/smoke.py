@@ -155,7 +155,169 @@ def main():
     check(status == 200 and body["sealed"] is False and body["receipt"] is None,
           "no receipt exists after digest mismatch")
 
+    audit_smoke(s, suffix)
+
     print(f"\nSMOKE OK against {BASE} (sessions {s}, {sb})")
+
+
+def post_json(path, payload):
+    data = json.dumps(payload).encode()
+    return call("POST", path, data, {"Content-Type": "application/json"})
+
+
+def audit_smoke(sealed_session, suffix):
+    """Audit-plan contract over HTTP on an already sealed 3-chunk session."""
+    sa = f"AUD{suffix}"
+
+    print("[audit: sealed prerequisite]")
+    # A fresh sealed 5-chunk session gives room for non-adjacent samples.
+    blob = bytes((i * 7) % 251 for i in range(4 * CHUNK + 17))
+    digest = hashlib.sha256(blob).hexdigest()
+    for i in range(5):
+        part = blob[i * CHUNK:(i + 1) * CHUNK]
+        st, _ = put(sa, i * CHUNK, part, len(blob), digest)
+        assert st == 200, st
+    st, receipt = call("POST", f"/api/uploads/{sa}/seal")
+    check(st == 200 and receipt["chunks"] == 5, "5-chunk session sealed for audit")
+
+    # An unsealed session must never produce a plan.
+    su = f"AUDU{suffix}"
+    put(su, 0, b"z" * 10, 10, hashlib.sha256(b"z" * 10).hexdigest())
+    st, body = post_json(
+        f"/api/uploads/{su}/audit-plan",
+        {"target": 2, "risks": [1, 2], "zones": [{"start": 0, "end": 1, "quota": 1}]},
+    )
+    check(st == 409 and body.get("sealed") is False,
+          "audit-plan on unsealed session -> 409, no plan")
+    st, body = call("GET", f"/api/uploads/{su}")
+    check(body.get("audit_plan") is None, "unsealed session keeps audit_plan=null")
+
+    # Unknown session -> 404.
+    st, _ = post_json(
+        f"/api/uploads/NOPE{suffix}/audit-plan",
+        {"target": 2, "risks": [1, 2], "zones": [{"start": 0, "end": 1, "quota": 1}]},
+    )
+    check(st == 404, "audit-plan on unknown session -> 404")
+
+    print("[audit: located validation rejections]")
+    good_zones = [{"start": 0, "end": 4, "quota": 1}]
+    st, body = post_json(
+        f"/api/uploads/{sa}/audit-plan",
+        {"target": 1, "risks": [1] * 5, "zones": good_zones},
+    )
+    check(st == 400 and "between 2 and 16" in body["error"], "target < 2 -> 400")
+    st, _ = post_json(
+        f"/api/uploads/{sa}/audit-plan",
+        {"target": 17, "risks": [1] * 5, "zones": good_zones},
+    )
+    check(st == 400, "target > 16 -> 400")
+    st, body = post_json(
+        f"/api/uploads/{sa}/audit-plan",
+        {"target": 6, "risks": [1] * 5, "zones": good_zones},
+    )
+    check(st == 400 and "exceeds total" in body["error"], "target > chunks -> 400")
+    st, body = post_json(
+        f"/api/uploads/{sa}/audit-plan",
+        {"target": 2, "risks": [1] * 4, "zones": good_zones},
+    )
+    check(st == 400 and "exactly 5" in body["error"], "risk count mismatch -> 400")
+    st, body = post_json(
+        f"/api/uploads/{sa}/audit-plan",
+        {"target": 2, "risks": [1, 101, 1, 1, 1], "zones": good_zones},
+    )
+    check(st == 400 and "between 0 and 100" in body["error"], "risk > 100 -> 400")
+    st, body = post_json(
+        f"/api/uploads/{sa}/audit-plan",
+        {"target": 2, "risks": [1] * 5, "zones": [{"start": 3, "end": 1, "quota": 1}]},
+    )
+    check(st == 400, "start > end -> 400")
+    st, body = post_json(
+        f"/api/uploads/{sa}/audit-plan",
+        {"target": 2, "risks": [1] * 5,
+         "zones": [{"start": 0, "end": 2, "quota": 1}, {"start": 2, "end": 4, "quota": 1}]},
+    )
+    check(st == 400 and "overlap" in body["error"], "overlapping zones -> 400")
+    st, _ = post_json(
+        f"/api/uploads/{sa}/audit-plan",
+        {"target": 2, "risks": [1] * 5, "zones": []},
+    )
+    check(st == 400, "zero zones -> 400")
+
+    print("[audit: feasible plan is optimal, non-adjacent, quotas met]")
+    risks = [10, 95, 20, 90, 30]
+    st, plan = post_json(
+        f"/api/uploads/{sa}/audit-plan",
+        {"target": 2, "risks": risks,
+         "zones": [{"start": 0, "end": 1, "quota": 1}, {"start": 3, "end": 4, "quota": 1}]},
+    )
+    check(st == 200 and plan["feasible"] is True, f"feasible plan -> 200: {plan}")
+    selected = plan["selected"]
+    check(len(selected) == 2, f"exactly target chunks: {selected}")
+    check(all(b != a + 1 for a, b in zip(selected, selected[1:])),
+          f"no adjacent selected chunks: {selected}")
+    # one pick in each mandatory zone, maximizing risk -> {1, 3}
+    check(selected == [1, 3], f"optimum + lexicographic selection [1,3]: {selected}")
+    check(plan["risk_total"] == 95 + 90, "risk total maximized")
+    check(all(z["quota_met"] for z in plan["zones"]), "every zone quota met")
+    check(len(plan["per_chunk"]) == 5, "per-chunk rows present")
+    rows = {row["index"]: row for row in plan["per_chunk"]}
+    check(rows[0]["zone"] == 0 and rows[4]["zone"] == 1 and rows[2]["zone"] is None,
+          "per-chunk zone attribution correct")
+    check(rows[1]["selected"] is True and rows[1]["risk"] == 95, "per-chunk risk shown")
+
+    print("[audit: plan is persisted next to the receipt]")
+    st, body = call("GET", f"/api/uploads/{sa}")
+    check(st == 200 and body["sealed"] is True and body["receipt"] is not None,
+          "sealed status + receipt intact after audit planning")
+    check(body.get("audit_plan", {}).get("selected") == [1, 3],
+          "audit plan exposed by status query")
+    check(body["audit_plan"]["session"] == sa and body["audit_plan"]["chunks"] == 5,
+          "persisted plan references session/chunks")
+
+    print("[audit: refilling conditions replaces; infeasible never fakes]")
+    st, plan2 = post_json(
+        f"/api/uploads/{sa}/audit-plan",
+        {"target": 3, "risks": [50] * 5, "zones": [{"start": 0, "end": 4, "quota": 1}]},
+    )
+    check(st == 200 and len(plan2["selected"]) == 3, "regeneration accepted")
+    st, body = call("GET", f"/api/uploads/{sa}")
+    check(body["audit_plan"]["target"] == 3, "newest plan replaces the old one")
+
+    # Infeasible: 5 chunks cannot yield 4 pairwise non-adjacent picks (cap 3).
+    st, body = post_json(
+        f"/api/uploads/{sa}/audit-plan",
+        {"target": 4, "risks": [1] * 5, "zones": [{"start": 0, "end": 4, "quota": 1}]},
+    )
+    check(st == 409 and body.get("feasible") is False and body.get("blocking"),
+          f"infeasible -> 409 with blocking conditions: {body}")
+    check(any(b["type"] == "global_capacity" for b in body["blocking"]),
+          "global capacity blocker named")
+    st, body = call("GET", f"/api/uploads/{sa}")
+    check(body["audit_plan"]["target"] == 3,
+          "infeasible request did not overwrite the prior plan")
+
+    print("[audit: forced adjacent zones block with located reason]")
+    # Two touching, saturated odd zones: [0,2] quota 2 forces {0,2} and
+    # [3,5] quota 2 forces {3,5}; chunks 2 and 3 collide. n=7 keeps the
+    # global non-adjacency capacity (4) >= target so this is the blocking
+    # reason, not a capacity shortfall.
+    s7 = f"AUD7{suffix}"
+    blob7 = b"k" * (6 * CHUNK + 1)
+    d7 = hashlib.sha256(blob7).hexdigest()
+    for i in range(7):
+        put(s7, i * CHUNK, blob7[i * CHUNK:(i + 1) * CHUNK], len(blob7), d7)
+    call("POST", f"/api/uploads/{s7}/seal")
+    st, body = post_json(
+        f"/api/uploads/{s7}/audit-plan",
+        {"target": 4, "risks": [1] * 7,
+         "zones": [{"start": 0, "end": 2, "quota": 2},
+                   {"start": 3, "end": 5, "quota": 2}]},
+    )
+    check(st == 409 and any(b["type"] == "zone_boundary_conflict"
+                            for b in body.get("blocking", [])),
+          f"forced-adjacent zones -> 409 boundary blocker: {body}")
+    st, status7 = call("GET", f"/api/uploads/{s7}")
+    check(status7.get("audit_plan") is None, "no fabricated plan for infeasible session")
 
 
 if __name__ == "__main__":

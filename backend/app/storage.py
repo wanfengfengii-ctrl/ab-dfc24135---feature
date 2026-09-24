@@ -133,6 +133,9 @@ class UploadStore:
     def _receipt_path(self, session: str) -> str:
         return os.path.join(self._dir(session), "receipt.json")
 
+    def _audit_plan_path(self, session: str) -> str:
+        return os.path.join(self._dir(session), "audit_plan.json")
+
     # ---- reads -----------------------------------------------------------
 
     def get_metadata(self, session: str) -> Optional[Metadata]:
@@ -166,6 +169,7 @@ class UploadStore:
                 return None
             present = sorted(self._present_indices(session, meta.chunk_count))
             receipt = self._read_receipt(session)
+            audit_plan = self._read_audit_plan(session)
             return {
                 "session": session,
                 "total_size": meta.total_size,
@@ -175,6 +179,7 @@ class UploadStore:
                 "missing_ranges": _missing_ranges(set(present), meta.chunk_count),
                 "sealed": receipt is not None,
                 "receipt": receipt,
+                "audit_plan": audit_plan,
             }
 
     def _read_receipt(self, session: str) -> Optional[dict]:
@@ -183,6 +188,22 @@ class UploadStore:
         except (FileNotFoundError, json.JSONDecodeError):
             return None
         return raw
+
+    def _read_audit_plan(self, session: str) -> Optional[dict]:
+        try:
+            raw = _read_json(self._audit_plan_path(session))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+        return raw
+
+    def save_audit_plan(self, session: str, plan: dict) -> None:
+        """Atomically persist a freshly generated plan (replaces any prior)."""
+        with self._lock:
+            os.makedirs(self._dir(session), exist_ok=True)
+            _atomic_write(
+                self._audit_plan_path(session),
+                (json.dumps(plan, indent=2) + "\n").encode(),
+            )
 
     # ---- writes ----------------------------------------------------------
 

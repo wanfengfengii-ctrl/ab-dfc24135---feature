@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import os
 import re
 from typing import Optional
@@ -16,6 +17,7 @@ from .storage import (
     RejectError,
     UploadStore,
 )
+from .audit import AuditPlanError, build_audit_plan
 
 SESSION_RE = re.compile(r"^[A-Za-z0-9]{1,32}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -56,6 +58,13 @@ def _reject_handler(_request: Request, exc: RejectError) -> JSONResponse:
 @app.exception_handler(ConflictError)
 def _conflict_handler(_request: Request, exc: ConflictError) -> JSONResponse:
     return JSONResponse(status_code=409, content={"error": str(exc)})
+
+
+@app.exception_handler(AuditPlanError)
+def _audit_plan_handler(_request: Request, exc: AuditPlanError) -> JSONResponse:
+    content: dict = {"error": exc.error}
+    content.update(exc.extra)
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 
 @app.get("/health")
@@ -117,6 +126,40 @@ def seal(session: str) -> JSONResponse:
             },
         )
     return JSONResponse(status_code=200, content=result)
+
+
+@app.post("/api/uploads/{session}/audit-plan")
+async def create_audit_plan(session: str, request: Request) -> JSONResponse:
+    _check_session(session)
+    status = store.status(session)
+    if status is None:
+        raise HTTPException(status_code=404, detail="no such session")
+    if not status["sealed"]:
+        # Plans may only be produced for packages that have a receipt.
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "session is not sealed; an audit plan requires a receipt",
+                "sealed": False,
+            },
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="request body must be valid JSON")
+
+    plan = build_audit_plan(int(status["chunk_count"]), body)
+    plan["session"] = session
+    plan["receipt_id"] = (status["receipt"] or {}).get("receipt_id")
+    plan["created_at"] = (
+        datetime.datetime.now(datetime.timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+    # Persist the newest plan atomically, replacing any previous one.
+    store.save_audit_plan(session, plan)
+    return JSONResponse(status_code=200, content=plan)
 
 
 # Serve the built React SPA from the same origin (API routes take priority).

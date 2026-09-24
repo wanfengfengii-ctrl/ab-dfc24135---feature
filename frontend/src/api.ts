@@ -36,6 +36,61 @@ export interface SessionStatus {
   missing_ranges: [number, number][];
   sealed: boolean;
   receipt: Receipt | null;
+  audit_plan: AuditPlan | null;
+}
+
+export interface AuditZoneInput {
+  start: number;
+  end: number;
+  quota: number;
+}
+
+export interface AuditPlanRequest {
+  target: number;
+  risks: number[];
+  zones: AuditZoneInput[];
+}
+
+export interface AuditZoneResult {
+  start: number;
+  end: number;
+  quota: number;
+  selected: number[];
+  selected_count: number;
+  quota_met: boolean;
+}
+
+export interface AuditChunkRow {
+  index: number;
+  risk: number;
+  zone: number | null;
+  selected: boolean;
+}
+
+export interface AuditPlan {
+  feasible: boolean;
+  chunks: number;
+  target: number;
+  selected: number[];
+  risk_total: number;
+  zones: AuditZoneResult[];
+  per_chunk: AuditChunkRow[];
+  session: string;
+  receipt_id: string | null;
+  created_at: string;
+}
+
+export interface AuditBlocker {
+  type: string;
+  message: string;
+  [key: string]: unknown;
+}
+
+export interface AuditPlanResult {
+  status: number;
+  plan: AuditPlan | null;
+  blockers: AuditBlocker[] | null;
+  error: string | null;
 }
 
 export class ApiError extends Error {
@@ -118,6 +173,34 @@ export async function seal(session: string): Promise<SealResult> {
       ? ((err.body as { missing_ranges: [number, number][] }).missing_ranges ?? null)
       : null;
   return { status: res.status, receipt: null, missingRanges: ranges, error: err.message };
+}
+
+export async function createAuditPlan(
+  session: string,
+  req: AuditPlanRequest
+): Promise<AuditPlanResult> {
+  const res = await fetch(`/api/uploads/${session}/audit-plan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+  if (res.ok) {
+    return {
+      status: res.status,
+      plan: (await res.json()) as AuditPlan,
+      blockers: null,
+      error: null,
+    };
+  }
+  const err = await parseError(res);
+  const blockers =
+    err.body &&
+    typeof err.body === "object" &&
+    "blocking" in err.body &&
+    Array.isArray((err.body as { blocking: unknown }).blocking)
+      ? ((err.body as { blocking: AuditBlocker[] }).blocking ?? null)
+      : null;
+  return { status: res.status, plan: null, blockers, error: err.message };
 }
 
 import { sha256Bytes } from "./sha256";

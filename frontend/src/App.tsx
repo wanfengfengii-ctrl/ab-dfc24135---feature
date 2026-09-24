@@ -5,6 +5,7 @@ import {
   MAX_FILE_SIZE,
   MIN_FILE_SIZE,
   SESSION_RE,
+  AuditPlan,
   ChunkAck,
   Receipt,
   SessionStatus,
@@ -13,6 +14,7 @@ import {
   seal,
   sha256Hex,
 } from "./api";
+import AuditPlanCard from "./AuditPlanCard";
 import "./styles.css";
 
 interface ChunkError {
@@ -43,8 +45,14 @@ export default function App() {
   const [phase, setPhase] = useState<string>("");
   const [errors, setErrors] = useState<ChunkError[]>([]);
   const [receipt, setReceipt] = useState<Receipt | null>(null);
+  // Bumped every time an authoritative server status (or a fresh receipt) is
+  // applied; used to remount the audit card so its form re-syncs to the
+  // persisted plan.
+  const [statusSync, setStatusSync] = useState(0);
   const [sealed, setSealed] = useState(false);
   const [notice, setNotice] = useState<string>("");
+  // Latest authoritative status; supplies the persisted audit plan to the card.
+  const [serverPlan, setServerPlan] = useState<AuditPlan | null>(null);
 
   const sessionValid = SESSION_RE.test(session);
   const fileError = useMemo(() => {
@@ -62,6 +70,8 @@ export default function App() {
     setConfirmed(new Set());
     setErrors([]);
     setReceipt(null);
+    setServerPlan(null);
+    setStatusSync((n) => n + 1);
     setSealed(false);
     setNotice("");
     setChunkCount(0);
@@ -138,6 +148,18 @@ export default function App() {
     return true;
   }, [applyAck, digest, file, session]);
 
+  // Apply an authoritative server status: receipt + persisted audit plan are
+  // exposed together; remounting the audit card re-syncs its form.
+  const applyStatus = useCallback((status: SessionStatus) => {
+    setChunkCount(status.chunk_count);
+    setTotalSize(status.total_size);
+    setConfirmed(new Set(status.confirmed_chunks));
+    setSealed(status.sealed);
+    setReceipt(status.receipt);
+    setServerPlan(status.audit_plan);
+    setStatusSync((n) => n + 1);
+  }, []);
+
   const handleUploadAndSeal = useCallback(async () => {
     setBusy(true);
     setErrors([]);
@@ -148,8 +170,8 @@ export default function App() {
       setPhase("所有分块已确认，正在请求封存…");
       const result = await seal(session);
       if (result.receipt) {
-        setReceipt(result.receipt);
-        setSealed(true);
+        const status = await fetchStatus(session);
+        if (status) applyStatus(status);
         setNotice("封存成功，回执已生成并持久化。");
         setPhase("");
       } else if (result.missingRanges) {
@@ -162,15 +184,15 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [sendAllChunks, session]);
+  }, [applyStatus, sendAllChunks, session]);
 
   const handleSealOnly = useCallback(async () => {
     setBusy(true);
     try {
       const result = await seal(session);
       if (result.receipt) {
-        setReceipt(result.receipt);
-        setSealed(true);
+        const status = await fetchStatus(session);
+        if (status) applyStatus(status);
         setNotice("封存成功。");
       } else if (result.missingRanges) {
         setNotice(`仍有缺块：${formatRanges(result.missingRanges)}`);
@@ -180,7 +202,7 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [session]);
+  }, [applyStatus, session]);
 
   const handleRefresh = useCallback(async () => {
     if (!sessionValid) return;
@@ -192,11 +214,7 @@ export default function App() {
         setNotice("服务器上没有该会话（可能从未成功写入分块）。");
         return;
       }
-      setChunkCount(status.chunk_count);
-      setTotalSize(status.total_size);
-      setConfirmed(new Set(status.confirmed_chunks));
-      setSealed(status.sealed);
-      setReceipt(status.receipt);
+      applyStatus(status);
       setNotice(
         status.sealed
           ? "该会话已封存，回执如下（服务重启后仍然保留）。"
@@ -329,6 +347,15 @@ export default function App() {
             <dd>{receipt.sealed_at}</dd>
           </dl>
         </section>
+      )}
+
+      {sealed && chunkCount > 0 && (
+        <AuditPlanCard
+          key={`${session}:${statusSync}`}
+          session={session}
+          chunkCount={chunkCount}
+          restored={serverPlan}
+        />
       )}
     </main>
   );
